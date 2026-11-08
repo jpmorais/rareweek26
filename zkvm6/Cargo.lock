@@ -649,7 +649,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "zkvm5"
+name = "zkvm6"
 version = "0.1.0"
 dependencies = [
  "ff",

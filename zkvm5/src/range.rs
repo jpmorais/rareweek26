@@ -15,25 +15,18 @@
 // the limbs to v. Together: v = Σ (bytes) < 2^32.
 //
 // Which values, on which rows:
-//   c  — range-checked on every writing opcode (IMM, ADD, MUL). Guard: q_write
-//        = f_imm + f_add + f_mul (one-hot ⇒ q_write ∈ {0,1}).
+//   c  — range-checked on every WRITING opcode. q_write = f_imm + f_add +
+//        f_mul + f_xor (one-hot ⇒ q_write ∈ {0,1}). XOR is included because it
+//        writes c too: this c-recomposition is also the tie that makes the XOR
+//        chip's chunk lookups add up to the written c. (On XOR the c_limbs byte
+//        lookups here are redundant with the XOR table, but harmless.)
 //   hi — range-checked only on MUL (on ADD the carry is a single bit, confined
-//        by the ALU; on IMM/HALT hi is unused). Guard: f_mul.
+//        by the ALU; on IMM/HALT/XOR hi is unused). Guard: f_mul.
 //
 // The recomposition GATES are additionally guarded by the fixed selector
-// q_exec. A create_gate constraint is checked on every row, including the
-// "unusable" blinding rows in the circuit's tail, where advice columns are not
-// the clean 0 one might assume — so a guard built only from advice flags
-// (q_write / f_mul) can spuriously fire there. q_exec is a fixed column: it is
-// 0 on the unusable rows by construction, so multiplying by it switches the
-// gate off exactly where it must be off. The other chips (ALU, flags) already
-// multiply by q_exec for the same reason.
-//
-// Lookup conditioning: the input is `guard · limb`. When guard = 0 the input
-// is 0, which is in byte_table, so the lookup passes trivially on rows that
-// don't range-check that value. Lookups do NOT need the q_exec guard: on the
-// unusable rows the input collapses to 0, which is in the table, so the lookup
-// is satisfied there — a different mechanism from create_gate's per-row check.
+// q_exec, which is 0 on the unusable blinding rows — a guard built only from
+// advice flags can spuriously fire there. The lookups do NOT need q_exec: on
+// the unusable rows the input collapses to 0, which is in the table.
 
 use halo2_proofs::{
     halo2curves::bn256::Fr,
@@ -69,13 +62,14 @@ impl RangeConfig {
         // limb weights: 2^0, 2^8, 2^16, 2^24
         let weight = |i: usize| Expression::Constant(Fr::from(1u64 << (8 * i)));
 
-        // --- recomposition of c: holds on every writing opcode (IMM/ADD/MUL) ---
+        // --- recomposition of c: holds on every writing opcode ---
         meta.create_gate("range: c = Σ c_limbs·2^(8i)", |meta| {
             let q = meta.query_fixed(q_exec, Rotation::cur());
             let f_imm = meta.query_advice(flags.imm, Rotation::cur());
             let f_add = meta.query_advice(flags.add, Rotation::cur());
             let f_mul = meta.query_advice(flags.mul, Rotation::cur());
-            let q_write = f_imm + f_add + f_mul; // one-hot ⇒ ∈ {0,1}
+            let f_xor = meta.query_advice(flags.xor, Rotation::cur());
+            let q_write = f_imm + f_add + f_mul + f_xor; // one-hot ⇒ ∈ {0,1}
 
             let c = meta.query_advice(c, Rotation::cur());
             let l0 = meta.query_advice(c_limbs[0], Rotation::cur());
@@ -85,7 +79,6 @@ impl RangeConfig {
             let recomposed =
                 l0 * weight(0) + l1 * weight(1) + l2 * weight(2) + l3 * weight(3);
 
-            // q_exec switches the gate off on unusable rows; q_write off on HALT.
             vec![q * q_write * (c - recomposed)]
         });
 
@@ -106,13 +99,13 @@ impl RangeConfig {
         });
 
         // --- byte lookups for c_limbs (conditioned by q_write) ---
-        // Four independent single-column lookups: each limb ∈ byte_table.
         for i in 0..4 {
             meta.lookup("range: c_limb is a byte", |meta| {
                 let f_imm = meta.query_advice(flags.imm, Rotation::cur());
                 let f_add = meta.query_advice(flags.add, Rotation::cur());
                 let f_mul = meta.query_advice(flags.mul, Rotation::cur());
-                let q_write = f_imm + f_add + f_mul;
+                let f_xor = meta.query_advice(flags.xor, Rotation::cur());
+                let q_write = f_imm + f_add + f_mul + f_xor;
                 let limb = meta.query_advice(c_limbs[i], Rotation::cur());
                 vec![(q_write * limb, byte_table)]
             });

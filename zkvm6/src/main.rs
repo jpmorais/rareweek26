@@ -7,6 +7,7 @@ mod control;
 mod regfile;
 mod range;
 mod xor;
+mod memory;
 
 fn main() {
     println!("Hello, world!");

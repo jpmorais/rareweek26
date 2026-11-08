@@ -1,6 +1,6 @@
 // control.rs — governs the clock, the program counter, and termination.
 //
-// No branches in this ISA, so the control flow is simple: the clock always
+// No branches in this ISA yet, so control flow is simple: the clock always
 // advances, the pc advances by one except on HALT (which freezes it), and the
 // trace must start at the beginning and end halted.
 //
@@ -8,14 +8,22 @@
 //   clock anchor      q_first · clk = 0                     clk starts at 0
 //   clock step        q_step  · (clk' − clk − 1) = 0        clk increments
 //   pc anchor         q_first · pc = 0                      pc starts at 0
-//   pc step           q_step  · [ (f_imm+f_add+f_mul)·(pc'−pc−1)
-//                                 + f_hlt·(pc'−pc) ] = 0
+//   pc step           q_step  · [ advances·(pc'−pc−1)
+//                                 + f_hlt·(pc'−pc) ] = 0    with advances = 1−f_hlt
 //   halt absorbing    q_step  · f_hlt · (f_hlt' − 1) = 0    HALT stays HALT
 //   halt at end       q_last  · (f_hlt − 1) = 0             trace ends halted
 //
+// advances = 1 − f_hlt. Every non-HALT opcode advances the pc by one; only
+// HALT freezes it. This is written as the COMPLEMENT of f_hlt rather than a
+// list of advancing flags (f_imm + f_add + ...) on purpose: the list form
+// silently forgot new opcodes (XOR, then LOAD/STORE), leaving the pc free on
+// those rows — a latent soundness hole. The complement form couples nothing:
+// any opcode that is not HALT advances automatically. It relies on the one-hot
+// invariant (exactly one flag = 1, imposed at the top level), which guarantees
+// 1 − f_hlt ∈ {0, 1}.
+//
 // The clock never freezes — not even in padding — so clk' = clk + 1 holds on
-// every transition with no special case. Only the pc has a halt case, because
-// only the pc has stop semantics.
+// every transition with no special case. Only the pc has a halt case.
 //
 // Preconditions (imposed elsewhere): flags boolean and one-hot (top-level).
 
@@ -56,8 +64,8 @@ impl ControlConfig {
             let one = Expression::Constant(Fr::one());
 
             vec![
-                q_first * clk.clone(),                 // clk[0] = 0
-                q_step * (clk_next - clk - one),       // clk' = clk + 1
+                q_first * clk.clone(),           // clk[0] = 0
+                q_step * (clk_next - clk - one), // clk' = clk + 1
             ]
         });
 
@@ -67,19 +75,16 @@ impl ControlConfig {
             let q_step = meta.query_fixed(q_step, Rotation::cur());
             let pc_next = meta.query_advice(pc, Rotation::next());
             let pc = meta.query_advice(pc, Rotation::cur());
-            let f_imm = meta.query_advice(flags.imm, Rotation::cur());
-            let f_add = meta.query_advice(flags.add, Rotation::cur());
-            let f_mul = meta.query_advice(flags.mul, Rotation::cur());
             let f_hlt = meta.query_advice(flags.hlt, Rotation::cur());
             let one = Expression::Constant(Fr::one());
 
-            let advances = f_imm + f_add + f_mul;
+            // advances = 1 − f_hlt : every non-HALT opcode advances the pc.
+            let advances = one.clone() - f_hlt.clone();
             let delta = pc_next - pc.clone(); // pc' − pc
 
             vec![
                 q_first * pc, // pc[0] = 0
-                q_step
-                    * (advances * (delta.clone() - one) + f_hlt * delta),
+                q_step * (advances * (delta.clone() - one) + f_hlt * delta),
             ]
         });
 

@@ -88,7 +88,7 @@ use super::*;
     }
 
         #[test]
-    fn it_does_not_works() {
+    fn it_fails() {
 
         let circuit = MyCircuit {
             x: Value::known(Fp::from(2)),

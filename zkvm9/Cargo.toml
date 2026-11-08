@@ -1,8 +1,0 @@
-[package]
-name = "zkvm5"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-ff = "0.13.0"
-halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2", tag = "v0.4.0" }

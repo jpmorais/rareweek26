@@ -1,7 +1,7 @@
 [package]
-name = "p4"
+name = "p10"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2", tag = "v0.4.0" }
+halo2_proofs = "0.4.0"

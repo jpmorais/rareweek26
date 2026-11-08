@@ -1,44 +1,42 @@
 // vm_trace.rs — the machine's vocabulary: opcodes, instructions, trace row.
 //
-// A minimal, purely arithmetic ISA: IMM, ADD, MUL, HALT. Four registers
-// (r0..r3), no memory, no branching. Arithmetic is now 32-bit modular
-// (wrapping) rather than full-field: ADD and MUL wrap at 2^32, and the
-// circuit enforces that wrap via range checks. The prover still computes
-// everything in the trace; the circuit only verifies.
+// ISA: IMM, ADD, MUL, HALT, XOR, LOAD, STORE. Four registers, a read-write data
+// memory (LOAD/STORE), no branching yet. The prover computes everything in the
+// trace; the circuit only verifies.
 //
-// Conventions (mirrored by the circuit chips):
-//   - each TraceRow records the state at the START of the instruction;
-//   - execution ends ON the HALT row;
-//   - padding repeats the HALT row (HALT is absorbing and freezes the
-//     state), so there is no NOP opcode: HALT does double duty (stop + pad).
+// The TraceRow now carries THREE layers:
+//   (1) execution state + datapath (clk, pc, op, regs, a, b, c, ...)
+//   (2) 32-bit auxiliaries (hi and the limbs) for arithmetic / XOR
+//   (3) the memory access on this row (mem_*), PLUS the SORTED memory table
+//       row (s_*, d_inv, delta limbs, z) used by the offline memory argument.
+// Layers (1)+(2) are in chronological order. The s_* fields are DIFFERENT: the
+// s_* of row i is the i-th row of the memory accesses SORTED by (addr, clk) —
+// unrelated to what executes at cycle i. Both live on the same physical row so
+// the grand product can compare them at the same rotation.
 //
-// Datapath columns a, b, c:
-//   a = value read from regs[rs1]   (left operand)
-//   b = value read from regs[rs2]   (right operand)
-//   c = result, written into regs[rd] on the NEXT row
-// The circuit cannot index an array by rs1; the prover writes the read value
-// into a/b, and the RegFile proves (via Lagrange) that a/b match the right
-// registers. The ALU produces c; the RegFile writes c into regs[rd].
-//
-// 32-bit arithmetic auxiliaries (new in this VM):
-//   hi       = high part of the euclidean division of (a+b) or (a*b) by 2^32
-//   c_limbs  = the four 8-bit limbs of c   (range-checked on every write)
-//   hi_limbs = the four 8-bit limbs of hi  (range-checked under MUL only)
-// These are witnesses: the emulator fills them, synthesize copies them, and
-// the ALU + RangeCheck chips verify them.
+// STAGE 2 (zkvm5): the grand-product challenges beta/gamma are now real
+// Fiat-Shamir challenges, drawn AFTER the first-phase columns are committed.
+// The emulator therefore NO LONGER computes z — it cannot, since the challenge
+// does not exist until proving time. The z field below is filled by the circuit
+// in the second phase of synthesize. The emulator still produces everything
+// else (the sorted table, d_inv, and the ordering limbs are all first-phase,
+// challenge-independent).
 
-/// The four opcodes. The integer value is the encoding used by the future
-/// Fetch chip.
+use halo2_proofs::halo2curves::bn256::Fr;
+
+/// The opcodes. The integer value is the encoding used by the future Fetch
+/// chip; it also matches the flag index in `flags_for`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Op {
-    Imm = 0,  // rd = imm            (c = imm)
-    Add = 1,  // rd = a + b mod 2^32 (c = (a + b) & 0xFFFF_FFFF)
-    Mul = 2,  // rd = a * b mod 2^32 (c = (a * b) & 0xFFFF_FFFF)
-    Halt = 3, // stop (and pad)
+    Imm = 0,   // rd = imm
+    Add = 1,   // rd = a + b mod 2^32
+    Mul = 2,   // rd = a * b mod 2^32
+    Halt = 3,  // stop (and pad)
+    Xor = 4,   // rd = a ^ b
+    Load = 5,  // rd = m[rs1]
+    Store = 6, // m[rs1] = rs2
 }
 
-/// A program instruction. Uniform format: every field always present, the
-/// unused ones left at zero.
 #[derive(Clone, Copy, Debug)]
 pub struct Instr {
     pub op: Op,
@@ -62,14 +60,23 @@ impl Instr {
         assert!(rd < 4 && rs1 < 4 && rs2 < 4);
         Instr { op: Op::Mul, rd, rs1, rs2, imm: 0 }
     }
+    pub fn xor(rd: u64, rs1: u64, rs2: u64) -> Self {
+        assert!(rd < 4 && rs1 < 4 && rs2 < 4);
+        Instr { op: Op::Xor, rd, rs1, rs2, imm: 0 }
+    }
+    pub fn load(rd: u64, rs1: u64) -> Self {
+        assert!(rd < 4 && rs1 < 4);
+        Instr { op: Op::Load, rd, rs1, rs2: 0, imm: 0 }
+    }
+    pub fn store(rs1: u64, rs2: u64) -> Self {
+        assert!(rs1 < 4 && rs2 < 4);
+        Instr { op: Op::Store, rd: 0, rs1, rs2, imm: 0 }
+    }
     pub fn halt() -> Self {
         Instr { op: Op::Halt, rd: 0, rs1: 0, rs2: 0, imm: 0 }
     }
 }
 
-/// A trace row: the full VM state at the start of the instruction. Values in
-/// u64 (the synthesize step converts to Fr). All arithmetic values (regs, a,
-/// b, c, hi) are < 2^32; the limbs are < 2^8.
 #[derive(Clone, Copy, Debug)]
 pub struct TraceRow {
     pub clk: u64,
@@ -80,89 +87,99 @@ pub struct TraceRow {
     pub rs2: u64,
     pub imm: u64,
     pub regs: [u64; 4],
-    pub a: u64, // left operand:  value read from regs[rs1]
-    pub b: u64, // right operand: value read from regs[rs2]
-    pub c: u64, // result: written into regs[rd] on the next row
+    pub a: u64,
+    pub b: u64,
+    pub c: u64,
 
-    // --- 32-bit arithmetic auxiliaries (trace-first: the emulator fills
-    //     these, synthesize copies them; the circuit only verifies) ---
-    /// High part of the euclidean division by 2^32, i.e. hi in
-    ///   a op b = c + hi * 2^32.
-    ///   ADD: the carry, in {0, 1}          (confined by the ALU, cheap).
-    ///   MUL: the high 32 bits of a*b        (confined by RangeCheck via limbs).
-    /// Unused (0) for IMM and HALT.
+    // 32-bit auxiliaries
     pub hi: u64,
-    /// The four 8-bit limbs of `c`, little-endian: c = Σ c_limbs[i] · 2^(8i).
-    /// Range-checked on every write (IMM, ADD, MUL).
     pub c_limbs: [u64; 4],
-    /// The four 8-bit limbs of `hi`, little-endian: hi = Σ hi_limbs[i] · 2^(8i).
-    /// Only meaningful for MUL (range-checked under q_mul); left 0 otherwise.
     pub hi_limbs: [u64; 4],
+    pub a_limbs: [u64; 4],
+    pub b_limbs: [u64; 4],
 
-    /// One-hot opcode flags, in canonical order [imm, add, mul, hlt].
-    /// Part of the witness: the emulator fills these, and synthesize copies
-    /// them verbatim into the flag columns — it computes nothing.
-    pub flags: [u64; 4],
+    // memory access on this row (chronological)
+    pub mem_addr: u64,
+    pub mem_value: u64,
+    pub mem_type: u64,   // 0 = READ, 1 = WRITE
+    pub mem_active: u64, // 1 on LOAD/STORE
+
+    // sorted memory table row (row i = i-th access sorted by (addr, clk)).
+    // Active accesses are placed contiguously at the top; the rest are inactive
+    // (s_active = 0) and take no part in the argument.
+    pub s_active: u64,
+    pub s_addr: u64,
+    pub s_value: u64,
+    pub s_clk: u64,
+    pub s_type: u64,
+    /// inverse of the address delta s_addr[i+1] − s_addr[i] (is-zero gadget).
+    pub d_inv: Fr,
+    /// 8-bit limbs of the address delta and (clk delta − 1), for ordering.
+    pub addr_delta_limbs: [u64; 4],
+    pub clk_delta_limbs: [u64; 4],
+    /// grand-product accumulator value on this row. STAGE 2: filled by the
+    /// circuit in the second phase of synthesize (depends on the Fiat-Shamir
+    /// challenge), NOT by the emulator. Left at the Fr::zero() default until
+    /// then.
+    pub z: Fr,
+
+    /// one-hot opcode flags [imm, add, mul, hlt, xor, load, store].
+    pub flags: [u64; 7],
 }
 
 impl TraceRow {
-    /// The one-hot flag vector for an opcode, in order [imm, add, mul, hlt].
-    pub fn flags_for(op: Op) -> [u64; 4] {
+    pub fn flags_for(op: Op) -> [u64; 7] {
         [
             (op == Op::Imm) as u64,
             (op == Op::Add) as u64,
             (op == Op::Mul) as u64,
             (op == Op::Halt) as u64,
+            (op == Op::Xor) as u64,
+            (op == Op::Load) as u64,
+            (op == Op::Store) as u64,
         ]
     }
 }
 
-/// Split a 32-bit value into four little-endian 8-bit limbs, so that
-///   v = limbs[0] + limbs[1]·2^8 + limbs[2]·2^16 + limbs[3]·2^24.
-/// The value MUST fit in 32 bits; the emulator guarantees this by construction
-/// (wrapping arithmetic), and the circuit re-proves it via the byte lookups.
-/// The debug_assert is a didactic safety net: a wrapping bug that lets a value
-/// exceed 32 bits is caught here, in Rust, instead of surfacing as an opaque
-/// lookup failure in the MockProver.
+/// Split a 32-bit value into four little-endian 8-bit limbs.
 pub fn limbs32(v: u64) -> [u64; 4] {
     debug_assert!(v < (1 << 32), "value {v} exceeds 32 bits");
-    [
-        v & 0xFF,
-        (v >> 8) & 0xFF,
-        (v >> 16) & 0xFF,
-        (v >> 24) & 0xFF,
-    ]
+    [v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF]
 }
 
-/// Pretty-prints a trace as a table, showing the FULL row: state, decode,
-/// datapath, and every 32-bit auxiliary (hi plus all eight limbs). Handy in
-/// `main` and in tests (run with `-- --nocapture` to see the output). The
-/// limbs are printed little-endian, matching `limbs32`: c[0] is the low byte.
-pub fn print_trace(trace: &[TraceRow]) {
+/// Arithmetic view: state, decode, datapath, and every 8-bit limb group.
+pub fn print_trace_arith(trace: &[TraceRow]) {
     println!(
-        "{:>3} {:>3} {:>5} {:>2} {:>3} {:>3} {:>10} | {:>17} | \
-         {:>10} {:>10} {:>10} {:>10} | {:>15} | {:>15}",
+        "{:>3} {:>3} {:>6} {:>2} {:>3} {:>3} {:>10} | {:>17} | \
+         {:>10} {:>10} {:>10} {:>4} | {:>13} {:>13} {:>13} {:>13}",
         "clk", "pc", "op", "rd", "rs1", "rs2", "imm", "regs",
-        "a", "b", "c", "hi", "c_limbs", "hi_limbs",
+        "a", "b", "c", "hi", "a_limbs", "b_limbs", "c_limbs", "hi_limbs",
     );
     for r in trace {
         println!(
-            "{:>3} {:>3} {:>5} {:>2} {:>3} {:>3} {:>10} | {:>17} | \
-             {:>10} {:>10} {:>10} {:>10} | {:>15} | {:>15}",
-            r.clk,
-            r.pc,
-            format!("{:?}", r.op),
-            r.rd,
-            r.rs1,
-            r.rs2,
-            r.imm,
-            format!("{:?}", r.regs),
-            r.a,
-            r.b,
-            r.c,
-            r.hi,
-            format!("{:?}", r.c_limbs),
-            format!("{:?}", r.hi_limbs),
+            "{:>3} {:>3} {:>6} {:>2} {:>3} {:>3} {:>10} | {:>17} | \
+             {:>10} {:>10} {:>10} {:>4} | {:>13} {:>13} {:>13} {:>13}",
+            r.clk, r.pc, format!("{:?}", r.op), r.rd, r.rs1, r.rs2, r.imm,
+            format!("{:?}", r.regs), r.a, r.b, r.c, r.hi,
+            format!("{:?}", r.a_limbs), format!("{:?}", r.b_limbs),
+            format!("{:?}", r.c_limbs), format!("{:?}", r.hi_limbs),
+        );
+    }
+}
+
+/// Memory view: the chronological access (mem_*) and the sorted table (s_*).
+pub fn print_trace(trace: &[TraceRow]) {
+    println!(
+        "{:>3} {:>6} | {:>8} {:>8} {:>4} {:>4} | {:>8} {:>8} {:>8} {:>5} {:>5}",
+        "clk", "op", "m_addr", "m_val", "m_t", "m_a",
+        "s_addr", "s_val", "s_clk", "s_ty", "s_act",
+    );
+    for r in trace {
+        println!(
+            "{:>3} {:>6} | {:>8} {:>8} {:>4} {:>4} | {:>8} {:>8} {:>8} {:>5} {:>5}",
+            r.clk, format!("{:?}", r.op),
+            r.mem_addr, r.mem_value, r.mem_type, r.mem_active,
+            r.s_addr, r.s_value, r.s_clk, r.s_type, r.s_active,
         );
     }
 }

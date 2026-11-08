@@ -1,4 +1,4 @@
-use halo2_proofs::{circuit::{SimpleFloorPlanner, Value}, plonk::{Advice, Circuit, Column, Instance, Selector}};
+use halo2_proofs::{circuit::{SimpleFloorPlanner, Value}, plonk::{Advice, Circuit, Column, Selector}};
 use halo2_proofs::pasta::Fp;
 use halo2_proofs::poly::Rotation;
 
@@ -14,7 +14,6 @@ struct CircuitConfig {
     a: Column<Advice>,
     b: Column<Advice>,
     c: Column<Advice>,
-    instance: Column<Instance>,
     q: Selector
 }
 
@@ -31,7 +30,6 @@ impl Circuit<Fp> for MyCircuit<Fp> {
         let a = meta.advice_column();
         let b = meta.advice_column();
         let c = meta.advice_column();
-        let instance = meta.instance_column();
         let q = meta.complex_selector();
 
         meta.create_gate("add gate", |meta| {
@@ -47,7 +45,7 @@ impl Circuit<Fp> for MyCircuit<Fp> {
         });
 
         CircuitConfig {
-            a, b, c, instance, q
+            a, b, c, q
         }
 
     }
@@ -112,14 +110,43 @@ use super::*;
             Value::known(Fp::from(13))],
         };
 
-        let instance = vec![];
-        let prover = MockProver::run(4, &circuit, vec![instance]).unwrap();
+        let prover = MockProver::run(4, &circuit, vec![]).unwrap();
         prover.assert_satisfied();
 
     }
 
         #[test]
     fn it_does_not_works() {
+
+        //  1 1 2
+        //  1 2 3
+        //  2 3 5
+        //  3 5 8
+        //  5 8 14  <- 5 + 8 != 14
+
+        let circuit = MyCircuit {
+            x: vec![
+            Value::known(Fp::from(1)),
+            Value::known(Fp::from(1)),
+            Value::known(Fp::from(2)),
+            Value::known(Fp::from(3)),
+            Value::known(Fp::from(5))],
+            y: vec![
+            Value::known(Fp::from(1)),
+            Value::known(Fp::from(2)),
+            Value::known(Fp::from(3)),
+            Value::known(Fp::from(5)),
+            Value::known(Fp::from(8))],
+            z: vec![
+            Value::known(Fp::from(2)),
+            Value::known(Fp::from(3)),
+            Value::known(Fp::from(5)),
+            Value::known(Fp::from(8)),
+            Value::known(Fp::from(14))],
+        };
+
+        let prover = MockProver::run(4, &circuit, vec![]).unwrap();
+        assert!(prover.verify().is_err());
 
     }
 
